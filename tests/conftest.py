@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 
 from app.probe import dns_wire
+from app.probe.cert_scan import CertChecker
 from app.probe.config import Settings
 from app.probe.dns_client import DnsResolver
 from app.probe.http_probe import Prober
@@ -206,6 +207,30 @@ def make_prober(fake_dns, demo_certs):
             read_timeout=read_timeout,
             tls_timeout=5.0,
             max_redirects=max_redirects,
+        )
+
+    return _factory
+
+
+@pytest.fixture()
+def make_checker(fake_dns, demo_certs):
+    """构造只允许 127.0.0.1/32 的 CertChecker 工厂。"""
+    _cert, _key, cafile = demo_certs
+
+    def _factory(
+        allowed=("127.0.0.1/32",),
+        connect_timeout: float = 3.0,
+        tls_timeout: float = 5.0,
+        overall_timeout: float = 20.0,
+    ) -> CertChecker:
+        resolver = DnsResolver("127.0.0.1", port=fake_dns.port, retries=0)
+        return CertChecker(
+            policy=AddressPolicy.from_cidrs(list(allowed)),
+            resolver=resolver,
+            ca_bundle=str(cafile),
+            connect_timeout=connect_timeout,
+            tls_timeout=tls_timeout,
+            overall_timeout=overall_timeout,
         )
 
     return _factory

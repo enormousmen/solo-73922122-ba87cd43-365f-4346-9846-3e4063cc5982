@@ -38,7 +38,7 @@ DEMO_NAMES = [
     "loop3.demo.test",
     "loop4.demo.test",
 ]
-DEMO_IPS = ["172.31.10.10", "172.31.20.10"]
+DEMO_IPS = ["172.31.10.10", "172.31.10.11", "172.31.20.10"]
 
 
 def _key() -> rsa.RSAPrivateKey:

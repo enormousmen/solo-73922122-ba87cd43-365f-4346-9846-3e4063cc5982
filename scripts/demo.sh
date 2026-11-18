@@ -39,6 +39,20 @@ switch_profile() {
     -d "$(jq -n --arg p "$profile" '{profile:$p}')" | jq -r '.active'
 }
 
+# scan_cert "<描述>" "<https-url>" [warn_days]
+scan_cert() {
+  local desc="$1" url="$2" warn_days="${3:-30}"
+  local body
+  body="$(jq -n --arg u "$url" --argjson w "$warn_days" '{url:$u, warn_days:$w}')"
+  echo
+  echo "================================================================"
+  echo "▶ ${desc}"
+  echo "  POST ${BASE}/api/v1/cert-scan  ${body}"
+  curl -sS -X POST "${BASE}/api/v1/cert-scan" \
+    -H 'Content-Type: application/json' \
+    -d "$body" | jq .
+}
+
 echo "### 0. 当前策略"
 curl -sS "${BASE}/api/v1/policy" | jq .
 
@@ -80,6 +94,19 @@ switch_profile allowed
 probe_url "IPv6 字面量：拒绝" "http://[2001:db8::1]/"
 probe_url "非 HTTP(S) scheme：拒绝" "ftp://allowed.demo.test${HPORT}/"
 probe_url "URL 携带 userinfo：拒绝" "http://u:p@allowed.demo.test${HPORT}/"
+
+# 7) 证书到期巡检：逐址核验 TLS 证书，不发送 HTTP 请求
+switch_profile allowed
+scan_cert "单后端域名证书巡检（全部地址核验通过）" \
+  "https://https.allowed.demo.test${SPORT}/" 30
+scan_cert "多后端域名（multi-a 两个 A 记录 -> 两台服务器）逐址巡检" \
+  "https://multi-a.demo.test${SPORT}/" 30
+scan_cert "告警阈值大于证书有效期：整体判临期，不能报告安全" \
+  "https://https.allowed.demo.test${SPORT}/" 4000
+switch_profile mixed
+scan_cert "混合 A 记录（允许+禁止）：整体拒绝，不发起任何连接" \
+  "https://multi-a.demo.test${SPORT}/" 30
+switch_profile allowed
 
 echo
 echo "### 验证禁止目标从未收到探测请求（应返回空列表）:"

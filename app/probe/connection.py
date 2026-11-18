@@ -45,6 +45,23 @@ async def open_tcp(
     return reader, writer, peer
 
 
+async def close_writer(writer: asyncio.StreamWriter | None,
+                       timeout: float = 1.0) -> None:
+    """关闭连接并 *有界* 等待关闭完成。
+
+    ``start_tls`` 在握手途中被取消后，``wait_closed`` 可能永不返回
+    （CPython 3.11 行为），因此等待必须带上限：关闭动作本身已发出，
+    对端会收到 FIN/RST，这里只是不再无限期等待确认。
+    """
+    if writer is None:
+        return
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
+    except (OSError, ssl.SSLError, asyncio.TimeoutError):
+        pass
+
+
 def build_ssl_context(ca_bundle: str | None) -> ssl.SSLContext:
     """构造强制校验的 TLS 上下文。
 

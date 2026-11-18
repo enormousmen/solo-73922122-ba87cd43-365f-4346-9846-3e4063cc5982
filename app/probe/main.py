@@ -15,6 +15,7 @@ from dataclasses import asdict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .cert_scan import CertChecker, CertScanReport
 from .config import Settings, load_settings
 from .dns_client import DnsResolver
 from .http_probe import Prober
@@ -87,6 +88,50 @@ class PolicyResponse(BaseModel):
     timeouts: dict
 
 
+class CertScanRequest(BaseModel):
+    url: str = Field(
+        ..., description="待巡检的 HTTPS URL（仅 https；路径不参与核验，不发 HTTP 请求）"
+    )
+    warn_days: int = Field(
+        30, ge=0, le=36500,
+        description="临期告警阈值（天）：证书剩余天数 ≤ 该值即判为临期",
+    )
+
+
+class CertAddressModel(BaseModel):
+    address: str = Field(..., description="被核验的 IPv4 地址（来自同一次 DNS 应答）")
+    status: str = Field(..., description="ok | expiring | error | unknown")
+    not_after: str | None = Field(None, description="证书到期时间（ISO8601 UTC）")
+    days_remaining: float | None = Field(None, description="距到期剩余天数")
+    tls_version: str | None = None
+    cipher: str | None = None
+    subject: str | None = Field(None, description="对端证书 subject")
+    error: str | None = Field(None, description="连接/TLS 握手失败原因")
+    note: str | None = Field(None, description="unknown 等状态的补充说明")
+
+
+class CertScanResponse(BaseModel):
+    requested_url: str
+    hostname: str = Field(..., description="URL 中的主机名（SNI 与证书校验均用它）")
+    port: int
+    warn_days: int
+    outcome: str = Field(
+        ..., description="ok | expiring | error | timeout | blocked"
+    )
+    summary: str = Field(..., description="人类可读的结论摘要")
+    resolved_addresses: list[str] = Field(
+        ..., description="DNS 实际返回的全部 A 记录（IPv4）"
+    )
+    approved_addresses: list[str] = Field(
+        ..., description="通过白名单校验的地址；整体被拒时为空列表"
+    )
+    addresses: list[CertAddressModel] = Field(..., description="逐地址证书核验结果")
+    allowed_cidrs: list[str] = Field(..., description="本次启动生效的 IPv4 白名单")
+    dns_server: str
+    overall_timeout: float = Field(..., description="整次巡检沿用的总时限（秒）")
+    elapsed_ms: int = Field(..., description="整次巡检耗时（毫秒）")
+
+
 settings: Settings = load_settings()
 resolver = DnsResolver(
     settings.dns_server,
@@ -103,6 +148,14 @@ prober = Prober(
     tls_timeout=settings.tls_timeout,
     max_redirects=settings.max_redirects,
 )
+cert_checker = CertChecker(
+    policy=settings.policy,
+    resolver=resolver,
+    ca_bundle=settings.ca_bundle,
+    connect_timeout=settings.connect_timeout,
+    tls_timeout=settings.tls_timeout,
+    overall_timeout=settings.overall_timeout,
+)
 _semaphore = asyncio.Semaphore(settings.max_concurrency)
 
 
@@ -113,11 +166,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="出站探测 API（Egress Probe）",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交 HTTP/HTTPS URL，返回逐跳状态、DNS 解析地址、实际连接地址与拒绝原因。"
         "仅支持 IPv4；每跳全部解析地址均在启动时配置的 CIDR 白名单内才会连接；"
         "最多跟随 3 次跳转；被拒目标不会收到任何探测请求；HTTPS 始终按原域名验证证书。"
+        "另提供证书到期巡检：对同一 HTTPS 域名的全部已批准地址逐址校验 TLS 证书"
+        "到期时间，不发送 HTTP 请求。"
     ),
     lifespan=lifespan,
 )
@@ -205,5 +260,50 @@ async def create_probe(req: ProbeRequest) -> ProbeResponse:
         allowed_cidrs=settings.allowed_cidrs,
         dns_server=f"{settings.dns_server}:{settings.dns_port}",
         max_redirects=settings.max_redirects,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+@app.post("/api/v1/cert-scan", response_model=CertScanResponse, tags=["cert"])
+async def create_cert_scan(req: CertScanRequest) -> CertScanResponse:
+    """证书到期巡检：逐址核验同一 HTTPS 域名全部已批准后端的证书。
+
+    沿用配置的解析器与 CIDR 白名单（一次 DNS 应答全部地址获准才连接）；
+    按原域名校验 TLS 证书并报告各地址到期时间，不发送 HTTP 请求；
+    任一地址临期或握手失败，整体都不能报告安全；到达既有总时限时保留
+    已核验结果，未完成地址标为 unknown。
+    """
+    started = time.monotonic()
+    # 与出站探测共用并发上限：慢巡检同样不能堆积阻塞他人
+    if _semaphore.locked():
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"探测并发已达上限 {settings.max_concurrency}，"
+                "为避免慢探测互相阻塞，请求被拒绝，请稍后重试"
+            ),
+        )
+
+    async with _semaphore:
+        try:
+            report: CertScanReport = await cert_checker.scan(req.url, req.warn_days)
+        except PolicyError as exc:
+            # 入口级静态错误（非法 URL、非 https scheme）：未产生任何流量
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    return CertScanResponse(
+        requested_url=report.url,
+        hostname=report.hostname,
+        port=report.port,
+        warn_days=report.warn_days,
+        outcome=report.outcome,
+        summary=report.summary,
+        resolved_addresses=report.resolved_addresses,
+        approved_addresses=report.approved_addresses,
+        addresses=[CertAddressModel(**asdict(a)) for a in report.addresses],
+        allowed_cidrs=settings.allowed_cidrs,
+        dns_server=f"{settings.dns_server}:{settings.dns_port}",
+        overall_timeout=settings.overall_timeout,
         elapsed_ms=elapsed_ms,
     )

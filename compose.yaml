@@ -66,6 +66,19 @@ services:
       net_allowed:
         ipv4_address: 172.31.10.10
 
+  # 允许访问的第二台目标：与 target-allowed 同构，作为 multi-a.demo.test
+  # 的另一台后端（同一 HTTPS 回调域名指向多台服务器的场景）
+  target-allowed-2:
+    build: .
+    command: ["python", "-m", "app.targets.server"]
+    environment:
+      CERT_DIR: /app/certs
+    volumes:
+      - certs:/app/certs:ro
+    networks:
+      net_allowed:
+        ipv4_address: 172.31.10.11
+
   # 禁止访问的目标：同镜像，位于禁止网段
   target-forbidden:
     build: .
@@ -112,6 +125,8 @@ services:
       dns-service:
         condition: service_started
       target-allowed:
+        condition: service_started
+      target-allowed-2:
         condition: service_started
 
 volumes:

@@ -16,11 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import ssl
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urljoin, urlsplit
 
-from .connection import TlsInfo, build_ssl_context, open_tcp, start_tls
+from .connection import TlsInfo, build_ssl_context, close_writer, open_tcp, start_tls
 from .dns_client import DnsError, DnsResolver
 from .policy import (
     AddressPolicy,
@@ -166,11 +165,7 @@ class Prober:
                     hop.mark_error(str(exc))
                     return None
                 finally:
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except (OSError, ssl.SSLError):
-                        pass
+                    await close_writer(writer)
             last_err = hop.error or hop.reject_reason
         # 所有已批准地址均连接失败
         hop.mark_error(f"全部已批准地址连接失败（未尝试任何未获准地址）: {last_err}")
@@ -178,6 +173,7 @@ class Prober:
 
     async def _try_one_address(self, hop, ip: ipaddress.IPv4Address,
                                scheme: str, host: str, method: str):
+        writer = None
         try:
             reader, writer, peer = await open_tcp(
                 ip, hop.port, self._connect_timeout
@@ -188,13 +184,20 @@ class Prober:
                     writer, reader, host, self._ssl, self._tls_timeout
                 )
                 hop.tls = asdict(tls_info)
-            return reader, writer, tls_info if scheme == "https" else None
+            # 连接成功：所有权移交调用方（由 _do_hop 的 finally 负责关闭）
+            handed_off = writer
+            writer = None
+            return reader, handed_off, tls_info if scheme == "https" else None
         except PolicyError as exc:
             # 记录失败原因后继续试下一个 *已批准* 地址
             hop.connected_peer = None
             hop.tls = None
             hop.error = str(exc)
             return None
+        finally:
+            # 握手失败或被取消（未移交）时，在此关闭连接，避免泄漏
+            if writer is not None:
+                await close_writer(writer)
 
     async def _send_and_read(
         self, hop: HopReport, reader, writer, method: str,
